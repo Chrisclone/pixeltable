@@ -1341,12 +1341,166 @@ class TestFunction:
             def _(x: int, unknown_param: int) -> dict[str, int]:
                 return {'requests': 1}
 
+        # Invalid: estimator uses *args
+        with pytest.raises(pxt.Error, match='must not use \\*args or \\*\\*kwargs'):
+
+            @self.func.resource_estimator
+            def _(*x: int) -> dict[str, int]:
+                return {'requests': 1}
+
+        # Invalid: estimator uses **kwargs
+        with pytest.raises(pxt.Error, match='must not use \\*args or \\*\\*kwargs'):
+
+            @self.func.resource_estimator
+            def _(**kwargs: int) -> dict[str, int]:
+                return {'requests': 1}
+
         # Invalid: polymorphic function
         with pytest.raises(pxt.Error, match='polymorphic'):
 
             @self.overloaded_udf.resource_estimator
             def _() -> dict[str, int]:
                 return {'requests': 1}
+
+    def test_shared_pool_different_estimators(self, uses_db: None) -> None:
+        """Two UDFs that share a resource pool but have different resource estimators must not raise AssertionError.
+
+        This is the core regression test for the PR: previously, get_request_resources was cached on
+        RateLimitsInfo with the first UDF's parameter signature, causing an AssertionError when the
+        second UDF (with a different signature) tried to use the same pool.  The fix moves
+        resource_estimator_fn onto each Function so every UDF carries its own estimator.
+        """
+        t = pxt.create_table('test', {'text': pxt.String, 'num': pxt.Int})
+        # Both UDFs use the same pool name ('rate-limits:test-shared-pool:fake-model')
+        # but carry different resource_estimators with different parameter subsets.
+        t.add_computed_column(alpha_out=_shared_pool_alpha(t.text))
+        t.add_computed_column(beta_out=_shared_pool_beta(t.num))
+
+        # Inserting multiple rows exercises the scheduler for each UDF.
+        # Previously this raised AssertionError when the second UDF hit the shared pool with its
+        # different parameter signature.  With the fix, each UDF carries its own estimator so
+        # there is no shared cached signature to conflict.
+        status = t.insert([{'text': 'hello', 'num': 2}, {'text': 'world', 'num': 5}])
+        assert status.num_rows == 2
+        assert status.num_excs == 0
+
+        result = t.order_by(t.num).collect()
+        assert result['alpha_out'][0] == 'HELLO'
+        assert result['alpha_out'][1] == 'WORLD'
+        assert result['beta_out'][0] == 'item-2'
+        assert result['beta_out'][1] == 'item-5'
+
+    def test_resource_estimator_via_scheduler(self, uses_db: None) -> None:
+        """A UDF's resource_estimator_fn is callable and returns correct values for various inputs."""
+        # Verify the estimator returns the right values when called directly with various inputs
+        assert _estimator_udf.resource_estimator_fn('hello', 5) == {'requests': 1, 'tokens': 5}
+        assert _estimator_udf.resource_estimator_fn('world', 100) == {'requests': 1, 'tokens': 100}
+        assert _estimator_udf.resource_estimator_fn('', 0) == {'requests': 1, 'tokens': 0}
+
+        # Also verify the UDF works as a computed column end-to-end
+        t = pxt.create_table('test', {'text': pxt.String, 'n': pxt.Int})
+        t.add_computed_column(result=_estimator_udf(t.text, t.n))
+        status = t.insert([{'text': 'abcdef', 'n': 3}, {'text': 'xyz', 'n': 2}])
+        assert status.num_rows == 2
+        assert status.num_excs == 0
+        rows = t.order_by(t.n).collect()
+        assert rows['result'][0] == 'xy'
+        assert rows['result'][1] == 'abc'
+
+    def test_default_resource_estimator(self) -> None:
+        """A UDF with no resource_estimator should default to returning an empty dict."""
+        # The default estimator takes no arguments and returns {}
+        result = _no_estimator_udf.resource_estimator_fn()
+        assert result == {}
+        assert isinstance(result, dict)
+
+        # A second UDF also gets its own independent default — {}
+        result2 = _no_estimator_udf_2.resource_estimator_fn()
+        assert result2 == {}
+
+        # Confirm the two functions each carry their own estimator_fn independently
+        # (each Function instance initialises __default_resource_estimator separately)
+        assert _no_estimator_udf.resource_estimator_fn is not _no_estimator_udf_2.resource_estimator_fn
+
+
+# ---------------------------------------------------------------------------
+# Module-level UDFs used by TestFunction.test_shared_pool_different_estimators
+#
+# These two UDFs share the same resource pool name but have different parameter
+# signatures and different resource_estimator decorators. This exercises the PR fix:
+# previously get_request_resources was cached on RateLimitsInfo with the first UDF's
+# signature, breaking the second UDF. Now each Function carries its own estimator.
+# ---------------------------------------------------------------------------
+
+
+@pxt.udf(is_deterministic=False)
+def _shared_pool_alpha(text: str, model: str = 'fake-model') -> str:
+    """UDF whose resource_estimator uses the 'text' param."""
+    return text.upper()
+
+
+@_shared_pool_alpha.resource_pool
+def _(model: str) -> str:
+    return f'rate-limits:test-shared-pool:{model}'
+
+
+@_shared_pool_alpha.resource_estimator
+def _(text: str) -> dict[str, int]:
+    # Only uses the 'text' param — different subset from _shared_pool_beta's estimator
+    return {'requests': 1, 'tokens': len(text)}
+
+
+@pxt.udf(is_deterministic=False)
+def _shared_pool_beta(num: int, model: str = 'fake-model') -> str:
+    """UDF whose resource_estimator uses the 'num' param — different from alpha."""
+    return f'item-{num}'
+
+
+@_shared_pool_beta.resource_pool
+def _(model: str) -> str:
+    # Same pool name as _shared_pool_alpha when called with the same model
+    return f'rate-limits:test-shared-pool:{model}'
+
+
+@_shared_pool_beta.resource_estimator
+def _(num: int) -> dict[str, int]:
+    # Only uses the 'num' param — completely different subset from _shared_pool_alpha's estimator
+    return {'requests': 1, 'tokens': num * 10}
+
+
+# ---------------------------------------------------------------------------
+# Module-level UDFs used by TestFunction.test_resource_estimator_via_scheduler
+# ---------------------------------------------------------------------------
+
+
+@pxt.udf(is_deterministic=False)
+def _estimator_udf(text: str, num_tokens: int, model: str = 'test-model') -> str:
+    return text[:num_tokens]
+
+
+@_estimator_udf.resource_pool
+def _(model: str) -> str:
+    return f'request-rate:test-endpoint:{model}'
+
+
+@_estimator_udf.resource_estimator
+def _(text: str, num_tokens: int) -> dict[str, int]:
+    return {'requests': 1, 'tokens': num_tokens}
+
+
+# ---------------------------------------------------------------------------
+# Module-level UDFs used by TestFunction.test_default_resource_estimator
+# ---------------------------------------------------------------------------
+
+
+@pxt.udf(is_deterministic=False)
+def _no_estimator_udf(x: int) -> int:
+    return x * 2
+
+
+@pxt.udf(is_deterministic=False)
+def _no_estimator_udf_2(name: str, count: int) -> str:
+    return name * count
 
 
 @pxt.udf

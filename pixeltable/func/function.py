@@ -442,7 +442,11 @@ class Function(ABC):
         """
         if self.is_polymorphic:
             raise excs.Error(f'resource_estimator cannot be used with polymorphic function {self.self_path or self}')
-        estimator_params = set(inspect.signature(fn).parameters.keys())
+        sig = inspect.signature(fn)
+        for p in sig.parameters.values():
+            if p.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
+                raise excs.Error(f'resource_estimator for {self.self_path or self} must not use *args or **kwargs')
+        estimator_params = set(sig.parameters.keys())
         fn_params = set(self.signature.parameters.keys())
         if not estimator_params.issubset(fn_params):
             raise excs.Error(

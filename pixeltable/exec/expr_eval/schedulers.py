@@ -141,18 +141,26 @@ class RateLimitsScheduler(Scheduler):
             return list(self.pool_info.resource_limits.keys())
 
     def _get_request_resources(self, request: FnCallArgs) -> dict[str, int]:
-        estimator = request.fn_call.fn.resource_estimator_fn
-        param_names = [p.name for p in inspect.signature(estimator).parameters.values()]
-        if len(param_names) == 0:
-            result = estimator()
-        else:
-            kwargs_batch = request.fn_call.get_param_values(param_names, request.rows)
-            if not request.is_batched:
-                result = estimator(**kwargs_batch[0])
+        try:
+            estimator = request.fn_call.fn.resource_estimator_fn
+            param_names = [p.name for p in inspect.signature(estimator).parameters.values()]
+            if len(param_names) == 0:
+                result = estimator()
             else:
-                batch_kwargs = {k: [d[k] for d in kwargs_batch] for k in kwargs_batch[0]}
-                constant_kwargs, batch_kwargs = request.pxt_fn.create_batch_kwargs(batch_kwargs)
-                result = estimator(**constant_kwargs, **batch_kwargs)
+                kwargs_batch = request.fn_call.get_param_values(param_names, request.rows)
+                if not request.is_batched:
+                    result = estimator(**kwargs_batch[0])
+                else:
+                    batch_kwargs = {k: [d[k] for d in kwargs_batch] for k in kwargs_batch[0]}
+                    constant_kwargs, batch_kwargs = request.pxt_fn.create_batch_kwargs(batch_kwargs)
+                    result = estimator(**constant_kwargs, **batch_kwargs)
+            if not isinstance(result, dict):
+                raise TypeError(f'resource_estimator must return dict, got {type(result).__name__}')
+        except Exception as exc:
+            _logger.warning(
+                f'resource_estimator for {request.fn_call.fn.display_name} failed: {exc}; using empty estimate'
+            )
+            return {}
         # Filter to resources known to the pool to avoid KeyError in _resource_delay()
         known = self._resources
         return {k: v for k, v in result.items() if k in known}
