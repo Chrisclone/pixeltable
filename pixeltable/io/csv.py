@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 import os
 import typing
 from pathlib import Path
@@ -60,8 +61,10 @@ def export_csv(
     - UUID: string representation
     - Json: JSON-encoded string
     - Array: JSON-encoded string (via `tolist()`)
-    - Binary: excluded from export (not representable in CSV)
-    - Image, Video, Audio, Document: file path or URL string
+    - Float NaN/Inf: exported as empty (treated as missing)
+    - Binary, Image, Video, Audio, Document: excluded from export
+
+    To export media file paths, select on the column's `localpath` or `fileurl` expression explicitly.
 
     Args:
         table_or_query: Table or Query to export.
@@ -74,7 +77,9 @@ def export_csv(
     else:
         query = table_or_query
 
-    col_types: dict[str, ts.ColumnType] = {name: ct for name, ct in query.schema.items() if not ct.is_binary_type()}
+    col_types: dict[str, ts.ColumnType] = {
+        name: ct for name, ct in query.schema.items() if not ct.is_binary_type() and not ct.is_media_type()
+    }
 
     result = query.collect()
 
@@ -91,14 +96,14 @@ def export_csv(
                 val = row[col_name]
                 if val is None:
                     csv_row.append('')
-                elif col_type.is_image_type():
-                    csv_row.append(str(val.filename) if hasattr(val, 'filename') and val.filename else '')
                 elif col_type.is_timestamp_type() or col_type.is_date_type():
                     csv_row.append(val.isoformat())
                 elif col_type.is_json_type():
                     csv_row.append(json.dumps(val))
                 elif col_type.is_array_type():
                     csv_row.append(json.dumps(val.tolist()))
+                elif isinstance(val, float) and (math.isnan(val) or math.isinf(val)):
+                    csv_row.append('')
                 else:
                     csv_row.append(val)
             writer.writerow(csv_row)

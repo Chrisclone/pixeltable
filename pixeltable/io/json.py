@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import typing
 from pathlib import Path
 from typing import Any
@@ -52,6 +53,17 @@ def import_json(
     )
 
 
+def _sanitize_nan(obj: Any) -> Any:
+    """Replace float NaN/Inf with None for RFC 8259 compliance."""
+    if isinstance(obj, float) and (math.isnan(obj) or math.isinf(obj)):
+        return None
+    if isinstance(obj, dict):
+        return {k: _sanitize_nan(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_sanitize_nan(v) for v in obj]
+    return obj
+
+
 def export_json(table_or_query: pxt.Table | pxt.Query, file_path: str | Path, *, indent: int | None = None) -> None:
     """
     Exports a query result or table to a JSON file.
@@ -68,8 +80,10 @@ def export_json(table_or_query: pxt.Table | pxt.Query, file_path: str | Path, *,
     - UUID: string
     - Json: native JSON value (object, array, etc.)
     - Array: nested JSON array (via `tolist()`)
-    - Binary: excluded from export (not representable in JSON)
-    - Image, Video, Audio, Document: file path or URL string
+    - Float NaN/Inf: exported as null (RFC 8259 compliance)
+    - Binary, Image, Video, Audio, Document: excluded from export
+
+    To export media file paths, select on the column's `localpath` or `fileurl` expression explicitly.
 
     Args:
         table_or_query: Table or Query to export.
@@ -82,7 +96,9 @@ def export_json(table_or_query: pxt.Table | pxt.Query, file_path: str | Path, *,
     else:
         query = table_or_query
 
-    col_types: dict[str, ts.ColumnType] = {name: ct for name, ct in query.schema.items() if not ct.is_binary_type()}
+    col_types: dict[str, ts.ColumnType] = {
+        name: ct for name, ct in query.schema.items() if not ct.is_binary_type() and not ct.is_media_type()
+    }
 
     result = query.collect()
 
@@ -97,14 +113,16 @@ def export_json(table_or_query: pxt.Table | pxt.Query, file_path: str | Path, *,
 
             if val is None:
                 row_dict[col_name] = None
-            elif col_type.is_image_type():
-                row_dict[col_name] = str(val.filename) if hasattr(val, 'filename') and val.filename else None
             elif col_type.is_timestamp_type() or col_type.is_date_type():
                 row_dict[col_name] = val.isoformat()
             elif col_type.is_uuid_type():
                 row_dict[col_name] = str(val)
             elif col_type.is_array_type():
-                row_dict[col_name] = val.tolist()
+                row_dict[col_name] = _sanitize_nan(val.tolist())
+            elif col_type.is_json_type():
+                row_dict[col_name] = _sanitize_nan(val)
+            elif isinstance(val, float) and (math.isnan(val) or math.isinf(val)):
+                row_dict[col_name] = None
             else:
                 row_dict[col_name] = val
         rows.append(row_dict)

@@ -2,12 +2,23 @@ import datetime
 import json
 import pathlib
 
+import pytest
+
 import pixeltable as pxt
 
 from ..utils import create_all_datatypes_tbl, validate_update_status
 
 
 class TestJson:
+    def test_export_exact_output(self, uses_db: None, tmp_path: pathlib.Path) -> None:
+        """Verify exact JSON content for known data."""
+        t = pxt.create_table('test_json_exact', {'name': pxt.String, 'val': pxt.Int, 'active': pxt.Bool})
+        t.insert([{'name': 'Alice', 'val': 1, 'active': True}, {'name': 'Bob', 'val': 2, 'active': False}])
+        json_path = tmp_path / 'exact.json'
+        pxt.io.export_json(t, json_path)
+        exported = json.loads(json_path.read_text(encoding='utf-8'))
+        assert exported == [{'name': 'Alice', 'val': 1, 'active': True}, {'name': 'Bob', 'val': 2, 'active': False}]
+
     def test_export_all_types(self, uses_db: None, tmp_path: pathlib.Path) -> None:
         """Export a table with every supported type and verify the JSON output."""
         t = create_all_datatypes_tbl()
@@ -26,18 +37,16 @@ class TestJson:
             assert exp_row['c_int'] == orig_row['c_int']
             assert exp_row['c_float'] == orig_row['c_float']
             assert exp_row['c_bool'] == orig_row['c_bool']
-
             assert isinstance(exp_row['c_timestamp'], str)
             assert isinstance(exp_row['c_date'], str)
             assert datetime.date.fromisoformat(exp_row['c_date']) == orig_row['c_date']
-
             assert exp_row['c_uuid'] == str(orig_row['c_uuid'])
             assert exp_row['c_json'] == orig_row['c_json']
             assert exp_row['c_array'] == orig_row['c_array'].tolist()
 
-            for col in ['c_image', 'c_video', 'c_audio', 'c_document']:
-                assert isinstance(exp_row[col], str), f'{col} should be a string'
-                assert exp_row[col] != '', f'{col} should not be empty'
+            # Media and binary columns must be excluded
+            for col in ['c_image', 'c_video', 'c_audio', 'c_document', 'c_binary']:
+                assert col not in exp_row, f'{col} should be excluded from export'
 
     def test_export_with_nulls(self, uses_db: None, tmp_path: pathlib.Path) -> None:
         """Verify null handling across multiple types."""
@@ -73,16 +82,13 @@ class TestJson:
     def test_export_with_query(self, uses_db: None, tmp_path: pathlib.Path) -> None:
         """Test export with filtering and column selection."""
         t = pxt.create_table('test_json_query', {'c_int': pxt.Int, 'c_string': pxt.String})
-        rows = [{'c_int': i, 'c_string': f'row_{i}'} for i in range(10)]
-        validate_update_status(t.insert(rows), expected_rows=10)
+        validate_update_status(t.insert([{'c_int': i, 'c_string': f'row_{i}'} for i in range(10)]), expected_rows=10)
 
-        # Filtered
         json_path = tmp_path / 'filtered.json'
         pxt.io.export_json(t.where(t.c_int < 5), json_path)
         with open(json_path, encoding='utf-8') as f:
             assert len(json.load(f)) == 5
 
-        # Column subset
         json_path2 = tmp_path / 'subset.json'
         pxt.io.export_json(t.select(t.c_string), json_path2)
         with open(json_path2, encoding='utf-8') as f:
@@ -95,13 +101,11 @@ class TestJson:
         source_path = str(pathlib.Path(__file__).parents[1] / 'data' / 'json' / 'example.json')
         t = pxt.io.import_json('test_json_fmt', source_path)
 
-        # Compact
         compact_path = tmp_path / 'compact.json'
         pxt.io.export_json(t, compact_path)
         compact = compact_path.read_text(encoding='utf-8')
         assert '\n' not in compact.strip() or compact.count('\n') <= 1
 
-        # Pretty-printed with non-ASCII preserved
         pretty_path = tmp_path / 'pretty.json'
         pxt.io.export_json(t, pretty_path, indent=2)
         pretty = pretty_path.read_text(encoding='utf-8')
@@ -120,5 +124,23 @@ class TestJson:
 
         original = t.order_by(t.name).collect()
         reimported = t2.order_by(t2.name).collect()
-
         assert original == reimported
+
+    def test_export_nan_inf(self, uses_db: None, tmp_path: pathlib.Path) -> None:
+        """NaN and Inf float values become null in JSON (RFC 8259)."""
+        t = pxt.create_table('test_json_nan', {'c_float': pxt.Float})
+        t.insert([{'c_float': float('nan')}, {'c_float': float('inf')}, {'c_float': float('-inf')}, {'c_float': 1.5}])
+        json_path = tmp_path / 'nan.json'
+        pxt.io.export_json(t, json_path)
+        exported = json.loads(json_path.read_text(encoding='utf-8'))
+        assert exported[0]['c_float'] is None
+        assert exported[1]['c_float'] is None
+        assert exported[2]['c_float'] is None
+        assert exported[3]['c_float'] == pytest.approx(1.5)
+
+    def test_export_empty_table(self, uses_db: None, tmp_path: pathlib.Path) -> None:
+        """Exporting a table with 0 rows produces an empty JSON array."""
+        t = pxt.create_table('test_json_empty', {'c_int': pxt.Int, 'c_string': pxt.String})
+        json_path = tmp_path / 'empty.json'
+        pxt.io.export_json(t, json_path)
+        assert json.loads(json_path.read_text(encoding='utf-8')) == []
